@@ -5,7 +5,7 @@
 > **改动历史不在这里**：某段代码为什么是现在这样，用 `git log` / `git blame` 查。
 > 条目关闭后直接删除；要留结论就移入文末「已解决」，并注明解决它的提交。
 
-最后更新：2026-11-18
+最后更新：2026-11-19
 
 ---
 
@@ -654,6 +654,41 @@ DLSS，块里报的却是 AMD 的 FFX SDK 与 `FSR?`。读日志的人会据此�
 
 - `Dx11FsrBridge/NgxBackend.cpp`：`g_params->Get` / `p->Set` 的调用点、`query_dlss_optimal_range` 里传入的回调
 
+---
+
+## 9. 交换链 vtable 的克隆长度在「拿不到接口 / 拿到异身份接口」时仍是固定值
+
+**现状**
+
+`install_swapchain_hooks`（`Dx11FsrBridge/Dx11FsrBridge.cpp`）按 `hook_method_count` 克隆交换链 vtable。
+该长度现已与「实际拿到的接口」在三条主路径上对齐（`IDXGISwapChain4` → 41、`IDXGISwapChain3` → 40、
+`IDXGISwapChain3` 因身份不符被弃用 → 40），但仍有三处按固定值处理：
+
+1. **两条 QI 都失败**：`hook_instance` 保持调用方的 `IDXGISwapChain`、`hook_method_count` 保持初值 41。
+   若该对象是自建 vtable 且拒绝 QI 的包装对象，`memcpy` 会多读邻接内存（克隆区是独立分配，不会写越界）。
+2. **`IDXGISwapChain4` 的 QI 成功但返回异身份对象**：该接口被弃用后，退回的对象仍按 41 项克隆。
+   依据是「该对象自己声明支持 `IDXGISwapChain4` ⇒ 按 DXGI 契约至少 41 项」，但这一前提对包装对象不必然成立。
+3. **同身份但 vtable 偏长的包装对象**：`IDXGISwapChain4` 的 QI 返回 `this`、而自建 vtable 只有 40 项时，仍按 41 项克隆。
+
+**影响**
+
+- 目前只是只读的多读几个指针：所有 patch 槽位最大到 40，且 37/38/40 三个色彩槽在「无色彩接口」的路径上不可达，
+  功能面不受影响；本机与已验证的打包环境（OptiScaler v0.9.4 的 `QueryInterface` 对所有 IID 返回自身）不触发。
+- 风险落在「未验证的第三方包装层」上：聚合 / tear-off 实现若自建 vtable，越读量取决于缺口大小。
+
+**推进需要**
+
+- 需要一条能确定「该对象实际有多少个 vtable 槽」的判据；目前没有可靠来源（DXGI 不提供 vtable 长度查询）。
+  可考虑：按接口继承链从最派生接口退到最靠近的已实现接口来确定长度，或对 `IDXGISwapChain1/2/3/4` 逐级 QI 取最派生者。
+- 需要一个**自建 vtable 的桩交换链**作为独立探针（按 `probe/` 下的独立 EXE 形态，取证等级 E1），
+  才能验证「两条 QI 都失败」与「异身份」两条路径的实际行为；现有 5 个单测都不覆盖 `install_swapchain_hooks`。
+- 若要收紧到「一律按最派生接口取长度」，需先证明该判据在真实 DXGI 对象上不产生假等价。
+
+**相关代码位置**
+
+- `Dx11FsrBridge/Dx11FsrBridge.cpp` 的 `install_swapchain_hooks`：`hook_instance` / `hook_method_count` 的初值、
+  两处 QI 分支、`if (patches.empty())` 守卫，以及 `clone_and_patch_vtable`（按 `method_count` 做 `VirtualAlloc` + `memcpy`）。
+- 常量 `k_swapchain_vtable_size` / `k_swapchain3_vtable_size`。
 ---
 
 ## 已解决
