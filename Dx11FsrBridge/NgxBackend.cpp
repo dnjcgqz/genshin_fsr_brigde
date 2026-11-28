@@ -64,6 +64,10 @@
 #include "Ffx12Backend.h" // ffx12::FrameInput / ffx12::backend()
 #include "Ffx12ShaderSource.h" // g_depth_extract_hlsl / g_motion_decode_d11_hlsl
 #include "NgxBackend.h"
+// #11 阶段 B（2026-11-29）：NGX 初始化前的准入判定（纯函数，零平台依赖，只 include <cstdint>）。
+//   ensure_init 第 5c 步只调这里的 decide() / refusal_reason()，**不做任何位比较** ——
+//   判据常量单一来源（AGENTS.md §五.2）；该头内没有 D3D / NGX / 全局，本 TU 引入它不增加任何依赖。
+#include "NgxFeatureGate.h"
 // ★ 2026-11-24（T3b）：NGX 参数袋 SEH 守卫的粘滞位（ngxguard::ngx_guard_tripped()）。
 //   should_release_all() 的第二个输入来自这里；守卫本身（9 个包装 + 3 个计数）全在该 header 内，
 //   本 TU 只用它的三个只读访问器。为什么日志不放进那个 header：它必须是 POD-only（C2712），
@@ -557,6 +561,18 @@ bool                      g_use_reactive  = false;
 float                     g_depth_scale = 1.0f;
 int                       g_log_level     = 1;
 bool                      g_passthrough   = false;
+// ---- NgxRefuseUnsupported（#11 阶段 B；默认 false / ini 里 0）----
+// 语义：ensure_init 第 5c 步按第 5b 步 GetFeatureRequirements 的答案决定「要不要在 Init_Ext
+//   之前收场」。true = 厂商明确答「架构不支持 / OS 版本过低」**且**是真 NGX 在回答时收场
+//   （fail-open：这一局不创建超分实例，下游照旧交回原生上采样）；false = 与阶段 A **行为等价**
+//   （初始化前只观测、不参与任何判定；键=0 时只多两次 bool 判断与短路，不走任何新分支）。
+// ★ 为什么是普通 bool 而不是 std::atomic：与 g_passthrough 同形 —— 写方是 load_config()
+//   （初始化线程），读方只在 ffx12::dispatch() 持 g_mutex 的调用栈内（见本文件 414-417 行的
+//   形态纪律）。只有跨 TU **无锁**读取的量才必须是 atomic（g_release_all 是那种），配置项不是。
+// ★ 默认 false 的第二个理由（除「默认值 = 改动前行为」之外）：判定所依赖的反向命题
+//   「厂商答 raw∈{4,8} ⇒ Init 必然失败」在现场**零样本**；若默认开，这类机器永不再产出
+//   「init ok=?」样本 ⇒ 等于把本功能自己的证伪通道抹掉。默认 0 时它们照旧产出样本。
+bool                      g_refuse_unsupported { false };
 
 // ---- NgxCrossKeyReuse（默认 true）----
 // ★ 为什么是 std::atomic<bool> 而 g_passthrough 是普通 bool：
@@ -2300,6 +2316,11 @@ static bool ensure_init(ID3D11Device *dev)
     //   全部失败结局（入口缺失 / 适配器取不到 / 非成功码 / 厂商实现 AV）都**只写日志**，
     //   随后照常落到 `guarded_init_ext(...)` —— 与改动前逐字相同，fail-open。
     //
+    // ★ 2026-11-29（#11 阶段 B，本行是**追加**）：上面那句「阶段 B 的准入规则全部未实施」只对第 5b 步
+    //   **自身**成立 —— 阶段 B 已落地下方第 5c 步（键 NgxRefuseUnsupported，默认 0）。键=1 且判据命中
+    //   （proxy==0 ∧ ok==1 ∧ raw 精确等于 4 或 8）时，本段之后**不会**落到 guarded_init_ext：那一局
+    //   在 5c 就收场（交回原生上采样）。键=0（默认）时本段与阶段 A 逐字相同。改本段时必须同时读 5c。
+    //
     // 【"每次 ensure_init 至多一条"的上界】（不加计数闸门，§五.6 要求先给上界）
     //   ① 本函数入口的 `g_inited` 短路 + 5 秒退避窗口 ⇒ 同一进程里至多几次；
     //   ② 失败退避窗口内直接早退（不走进本段），`g_release_all` 置位后也不再进 init；
@@ -2619,6 +2640,56 @@ static bool ensure_init(ID3D11Device *dev)
                   min_os_len, pci_str.c_str(), hit.kind,
                   g_entry_module_path.empty() ? L"(unknown)" : g_entry_module_path.c_str(), proxy);
 
+    // ========================================================================
+    // 2026-11-29（#11 阶段 B）：第 5c 步 —— 准入判定（键 NgxRefuseUnsupported，默认 0）
+    // ========================================================================
+    // 【它在做什么】
+    //   用上一步**已经算出来**的三个观测值（proxy / ok / raw）问一句「这一局要不要在 Init_Ext
+    //   之前收场」。判定本身**不在这里**：全部在 NgxFeatureGate.h 的 ngx_gate::decide()（纯函数）。
+    //   本文件因此不做任何位比较（AGENTS.md §五.2 判据常量单一来源）—— `raw == 4` 一类只许出现在
+    //   那个头里；两处各写一份，改一处忘一处就是两套口径，失败形态是「该拒的不拒」这种静默偏差。
+    // 【为什么拒绝必须上 proxy==0 锁】
+    //   代理（OptiScaler 一类）会**硬编码**答「支持」：2026-11-29 01:16 实测同字段但 min_arch=0、
+    //   entry=…\OptiScaler.dll、proxy=1 —— 它的答案不是 NGX 的事实。只按 raw 判会让代理用户的机器
+    //   被一个空答案关掉功能，而他们正是靠代理兜底。proxy=-1（不知道谁在回答）同样不放行：
+    //   无证据不下结论（§五.1，动作强度必须匹配证据强度）。
+    // 【为什么 raw==2（DriverVersionUnsupported）本批不拒绝】
+    //   驱动维度**零样本**，属已知未覆盖项（不是遗漏）；拒绝它同样需要一条未经验证的前提
+    //   「驱动不支持 ⇒ Init 必失败」。raw==16（NotImplemented：找不到 feature DLL，环境问题）同理。
+    // 【一次性正向行：为什么必须有】
+    //   没有它，「日志里没有 refused 行」是一个**空真**（§三 #24）：既可能是判据放行，也可能是
+    //   键没读到、或本步根本没执行。这一行只写「开关已开、块已执行」这一件由结构保证的事实，
+    //   **不写判据形状**（判定规则将来若变，这一行不会跟着撒谎）；拒绝行自己带 reason= 才是判据。
+    // ★ 形态与 ngx_vt_guard_report_armed()（本文件 1083-1089 行）逐字同形：函数内
+    //   static std::once_flag + std::call_once ⇒ 全进程至多一条（不因 shutdown_all 之后的设备重建
+    //   重复），且不新增任何全局计数器。
+    if (g_refuse_unsupported)
+    {
+        static std::once_flag once;
+        std::call_once(once, [] { log_ngx_error(L"ngx_core gate armed at=preinit enable=1"); });
+    }
+    // ★ 键=0 时两段都不执行 ⇒ 与阶段 A（初始化前只观测、不判定）逐字相同。
+    // ★ 拒绝行至多一条（§5.2 第 4 条，结构保证）：本分支置 g_release_all，而它**全文件没有
+    //   store(false)**、shutdown_all 也故意不清 ⇒ 置位后 dispatch 的第 2b 步就在第 3 步 ensure_init
+    //   之前早退，不会再走到这里。
+    if (g_refuse_unsupported && ngx_gate::decide(proxy, ok, raw) == ngx_gate::Decision::Refuse)
+    {
+        // ★★ 同步锚点（改一处必须改两处）：下面**四行**的语义与 fail_init()（本文件 1835-1841 行）
+        //    逐条等价 —— 一条日志行（那边在 1837）+ 置不可逆的全局放手位（1838）+ 5 s 退避窗口（1839）
+        //    + return false（1840）。两处若不同步，拒绝路径与失败路径的「放手段 / 退避语义」会静默分叉。
+        // ★ 为什么不复用 fail_init()：它的格式串带 rc=（语义是「厂商调用失败」），而拒绝是
+        //    「我们按证据选择**不调**那次 Init_Ext」—— 没有厂商 rc 可打，写 rc=0x0 等于伪造一个
+        //    「成功码形态」的事实。两条行的 reason= 取值域也**不相交**（这里只有 adapter_unsupported
+        //    与 os_below_min），现场据此能一眼区分「拒绝」与「厂商调用失败」。
+        log_ngx_error(L"ngx_core init refused at=preinit reason=%hs raw=0x%X min_arch=%u "
+                      L"min_os=%hs pci=%hs proxy=%d",
+                      ngx_gate::refusal_reason(raw), raw, min_arch,
+                      min_os_str.c_str(), pci_str.c_str(), proxy);
+        g_release_all.store(true, std::memory_order_relaxed);
+        g_init_retry_after_us = qpc_us() + 5000000ull;
+        return false;
+    }
+
     // ---- 第 6 步：Init_Ext(app_id, appdata, dev, NVSDK_NGX_Version_API, &fc) ← 第 5 参是 fc ----
     // 2026-11-17：改走 SEH 守卫（§3.4.0）。g_init_ext 是厂商 DLL 实现，AV 会带走整进程。
     unsigned long init_crash = 0;
@@ -2628,6 +2699,23 @@ static bool ensure_init(ID3D11Device *dev)
         return fail_init(L"init_crash", init_crash);
     if (init_rc != NVSDK_NGX_Result_Success)
         return fail_init(L"init", static_cast<unsigned>(init_rc));
+
+    // ------------------------------------------------------------------
+    // 编译期绑定（#11 阶段 B，2026-11-29）：5c 步用的两个判据常量必须**恒等于** SDK 枚举。
+    // ★ 为什么放在 NgxBackend.cpp 而不是 NgxFeatureGate.h：那个头是零依赖的纯决策层，不能
+    //   include NGX 头（否则就失去「任意机器可跑单测」这个唯一优势）；而本 TU 两个头都有。
+    // ★ 为什么位置在这里：放在第 6 步 `Init_Ext` 的两条失败返回**之后**。static_assert 是**编译期**
+    //   声明，放在这里只要求本 TU 被编译，不会被任何 `return` 跳过 —— 位置上没有语义，只有可读性。
+    // ★ 为什么必须有它：SDK 若改了这两位（或头里的常量被改错），拒绝位会静默指向别的含义，
+    //   那正是「判据看着成立、结论却全错」的形态（AGENTS.md §五）。
+    // ------------------------------------------------------------------
+    static_assert(ngx_gate::kAdapterUnsupported
+                      == static_cast<unsigned>(NVSDK_NGX_FeatureSupportResult_AdapterUnsupported),
+                  "gate constant drift");
+    static_assert(ngx_gate::kOsBelowMin
+                      == static_cast<unsigned>(
+                             NVSDK_NGX_FeatureSupportResult_OSVersionBelowMinimumSupported),
+                  "gate constant drift");
 
     // ---- 第 7 步：GetCapabilityParameters（全局一份，**不调 Reset()**）----
     // 2026-11-18：改走 SEH 守卫（§3.4.0）。厂商 DLL 是第三方实现，AV 会带走整进程；
@@ -5836,6 +5924,14 @@ void set_log_level(int lv)
 void set_passthrough(bool on)
 {
     g_passthrough = on;
+}
+
+// NgxRefuseUnsupported（#11 阶段 B，默认 false / ini 里 0）。只存值：判定全在 NgxFeatureGate.h
+//   （纯函数），本函数不做任何「顺手校验」——例如「不是真 NGX 就提前关掉」会造出第二套口径，
+//   而 proxy 是 ensure_init 第 5b 步**当场算出来**的观测值，在读取 ini 的那一刻还不存在。
+void set_refuse_unsupported(bool on)
+{
+    g_refuse_unsupported = on;
 }
 
 // 2026-11-10（B154）：NgxProvider 三态。越界（含 load_config 送来的 -1）静默回 auto，

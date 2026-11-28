@@ -420,6 +420,20 @@ fsrbridge_configure_test(NgxProviderPickTest)
 target_include_directories(NgxProviderPickTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME NgxProviderPickTest COMMAND NgxProviderPickTest)
 
+# ---- NgxFeatureGateTest：NGX 初始化前的准入判定（#11 阶段 B）----
+# 与上述两个 target 同性质：`NgxFeatureGate.h` 零 D3D / 零 NGX / 零全局 / 零 I/O，只 include
+# <cstdint> ⇒ 不需要任何开关、不需要 GPU / 游戏 / NGX 头 / 注册表。
+# 它钉住的是 ensure_init 第 5c 步的决策表：只有 proxy==0 且 ok==1 且 raw 精确等于 4 或 8
+# 才拒绝，其余（代理在回答 / 查询失败 / 组合位 / 未知位）一律放行。
+# 为什么这条判据必须有穷举单测：真实触发条件（厂商答 raw∈{4,8}）在开发机上造不出来，
+# 而它决定「这一局要不要在 Init_Ext 之前收场」⇒ 只能靠测试把「实现 == 决策表」钉死。
+add_executable(NgxFeatureGateTest
+    NgxFeatureGateTest.cpp
+)
+fsrbridge_configure_test(NgxFeatureGateTest)
+target_include_directories(NgxFeatureGateTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME NgxFeatureGateTest COMMAND NgxFeatureGateTest)
+
 if(DX11FSRBRIDGE_BUILD_TESTS)
     # il2cpp callsite hook：观察/跳过/还原模式 + per-instance 隔离 + 相机 hook。
     # 需链 Il2CppCallSiteHook.cpp。**此测试已实测通过**。

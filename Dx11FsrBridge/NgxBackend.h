@@ -60,6 +60,13 @@ void set_use_reactive_mask(bool on);                        // NgxUseReactiveMas
 void set_depth_scale(float scale);
 void set_log_level(int lv);                                 // NgxLogLevel 0..3，默认 1
 void set_passthrough(bool on);                              // NgxPassthrough，默认 false
+// NgxRefuseUnsupported（#11 阶段 B；默认 false / ini 里 0）——
+//   初始化**之前**按 GetFeatureRequirements 的答案拒绝「GPU 架构不支持 / OS 版本过低」的能力：
+//   这一局不创建超分实例，按既有 fail-open 交回原生上采样。
+// ★ 判定全在 NgxFeatureGate.h 的纯函数里（本 TU 不做位比较），本头只导出「存值」这一个入口。
+// ★ 默认 false ⇒ 与引入本键之前**行为等价**（键=0 时多两次 bool 判断与短路）：普通 bool，写于 load_config()、
+//   只在持 ffx12::g_mutex 的 ensure_init 调用栈内被读（形态纪律见 NgxBackend.cpp 的全局状态块）。
+void set_refuse_unsupported(bool on);
 // NgxCrossKeyReuse，默认 true（ini 里 1）。语义：instance_key 变了，但建池/建 feature 真正
 //   依赖的「render/display 尺寸 + color/output 格式」全等时，**复用**现有资源池与 feature，
 //   不销毁重建。false（ini 里 0）⇒ 每次 key 变化都走原来的 destroy + create，与引入该键之前

@@ -55,7 +55,7 @@ $routes = @()
 #    已从发布版整块剔除：本清单与发布模板都不再包含它们；需要诊断请用开发构建。
 #    Diagnostic keys are excluded from the release build - do not add them back here.
 #
-# ⚠️ 四个**故意不写**的例外：
+# ⚠️ 五个**故意不写**的例外：
 #    · Ffx12AsyncUpscale —— 由安装器 / 芙芙启动器按显卡自动写入（RDNA2→0、其他→1），
 #      本脚本写死 1 会与它的按显卡判定打架；
 #    · Ffx12DllPath     —— 路径键：留空即"随包 payload\AMD 的 SDK"，本脚本不覆盖
@@ -68,6 +68,8 @@ $routes = @()
 #    · Ffx12SingleInstance —— 发布模板缺省 0=全部接管（FFX 后端多机位/分屏场景的正确值），
 #      NGX 后端在代码里无视该键、一律按 1 处理。本脚本每次部署都跑，写死任一个值都会盖掉
 #      用户的手改；缺键时走代码内建缺省（同为 0，load_config 的 lpDefault=0），故不写也安全。
+#    · NgxRefuseUnsupported —— 实验 opt-in 键：写死 0 会在每次部署时把用户手改的 1 重置，
+#      掐断该功能的现场样本通道；键缺失时代码内建缺省 0，故不写也安全。
 $configValues = [ordered]@{
     # ---- 1. 核心功能 / Core features ----
     'Enabled'                   = '1'
@@ -120,7 +122,7 @@ $configValues = [ordered]@{
     # ---- 7. NGX(DLSS) 后端 / NGX backend（后端由 Ffx12Backend=auto 按显卡型号选）----
     # 默认值逐键与 Dx11FsrBridge.package.ini 的 [Dx11FsrBridge] 段、以及代码内建缺省一致
     # （load_config 的 NGX 键解析段）。改这里必须四处同步改（load_config + 本脚本 + package.ini + 提交信息）。
-    # ⚠️ Ffx12Backend **故意不在本表里**：见文件顶部"三个故意不写的例外"。
+    # ⚠️ Ffx12Backend **故意不在本表里**：见文件顶部"故意不写"的例外清单（那里不再写数字，避免与条目数漂移）。
     'NgxApplicationId'          = '1337'
     'NgxFeatureDirs'            = ''    # 空 = 自动探测含 nvngx_dlss.dll 的目录
     'NgxHdr'                    = '0'    # 0 = 强制 SDR（默认，NGX 收到 IsHDR 会拖影）/ auto 自动探测 / 1 强制 HDR

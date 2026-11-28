@@ -16,8 +16,8 @@
 #include "TransparentJitterHook.h"
 #include "Ffx12Backend.h"
 #include "GpuBackendPick.h" // Ffx12Backend=auto 的型号判据（纯 header，零依赖）
-#include "NgxBackend.h"   // ngx::set_*（D13 十键 + NgxCrossKeyReuse + NgxZeroCopy = 十二个键）。都有消费者；
-                          // 本头不含 NGX SDK 头，故 OFF 构型包含它也安全（REQ-08），
+#include "NgxBackend.h"   // ngx::set_*（D13 十键 + NgxCrossKeyReuse + NgxZeroCopy + NgxRefuseUnsupported
+                          // = 十三个键）。都有消费者；本头不含 NGX SDK 头，故 OFF 构型包含它也安全（REQ-08），
                           // 但下面所有 ngx:: 调用点都被 DX11FSRBRIDGE_ENABLE_NGX 守卫。
 // A 阶段（2026-11-10）：NGX 参数映射的**纯计算层**（零 D3D / 零 NGX / 零全局）。
 // 本 TU 只把"已算好的归一化 jitter / 配置值"喂进去，公式在 NgxParamMap.cpp。
@@ -4625,9 +4625,9 @@ void load_config()
     // 故与输入键相与：输入键=0 ⇒ 输出请求位=0 ⇒ 后端 reason 恒 off。
     ffx12::set_zero_copy_output(g_config.ffx12_zero_copy && g_config.ffx12_zero_copy_output);
     ffx12::set_hdr_input(g_config.ffx12_hdr_input);
-        // ---- D13 十键读取（SDS §3.13.1）+ 键 11 NgxCrossKeyReuse + 键 12 NgxZeroCopy：
-    //      紧邻 Ffx12Hdr 的读取点 ----
-    // 此处 blog::init() 尚未执行 ⇒ 12 个 setter 只存值、一行日志都不打；
+        // ---- D13 十键读取（SDS §3.13.1）+ 键 11 NgxCrossKeyReuse + 键 12 NgxZeroCopy + 键 13
+    //      NgxRefuseUnsupported：紧邻 Ffx12Hdr 的读取点 ----
+    // 此处 blog::init() 尚未执行 ⇒ 13 个 setter 只存值、一行日志都不打；
     // 唯一需要输出的是非法值告警，它先进 pending_warnings，由 initialize() 回放。
     //
     // ⚠️ Ffx12Backend 只接受**精确小写**的 auto / native / ngx：不 tolower、不 trim。
@@ -4802,10 +4802,24 @@ void load_config()
     const int ngx_zc =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxZeroCopy", 0, config_path.c_str());
     ngx::set_zero_copy(ngx_zc != 0);
+
+    // ---- 键 13：NgxRefuseUnsupported（2026-11-29 增；默认 0）----
+    // 1 = NGX 初始化**之前**按 GetFeatureRequirements 的答案拒绝「架构不支持 / OS 版本过低」的能力：
+    //     这一局不创建超分实例，按既有 fail-open 交回原生上采样（判定在 NgxFeatureGate.h）；
+    // 0 = 与引入本键之前**行为等价**（初始化前只观测、不参与判定；键=0 时多两次 bool 判断与短路）。
+    // ★ 默认 0（§F 7.4：默认值必须等于改动前行为）：判定所依赖的反向命题「厂商答 raw∈{4,8}
+    //   ⇒ Init 必然失败」在现场**零样本**（本机只有一块 RTX 4070、raw 恒为 0，触发条件造不出来）
+    //   ⇒ 先以「可开启的实验键」交付，默认不改任何人的行为；待首例「raw∈{4,8} 且 init ok=0」样本
+    //   到手后，由**另一次**改动把默认值改为 1（届时须重新审核）。
+    // ★ 只在 NGX 编进本产物时读（下面这个 #if 分支内）：#else 分支的产物里没有任何消费者，
+    //   读进来只会变成一个「有键名、无行为」的假开关。
+    const int ngx_refuse =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxRefuseUnsupported", 0, config_path.c_str());
+    ngx::set_refuse_unsupported(ngx_refuse != 0);
 #else
     // ---- REQ-08：NGX 未编译进本产物 ----
-    // 十二个键里只有 Ffx12Backend 有消费者（后端选择器归 ffx12），其余 11 个 NGX 键在 OFF
-    // 构型下没有任何消费者，故不读。缺键（lpDefault=L"auto"）/ 显式 auto ⇒ 交给
+    // 十三个键里只有 Ffx12Backend 有消费者（后端选择器归 ffx12），其余 12 个 NGX 键在 OFF
+    // 构型下没有任何消费者，故不读（键 13 NgxRefuseUnsupported 也不读：#if 分支里才有消费者）。缺键（lpDefault=L"auto"）/ 显式 auto ⇒ 交给
     // resolve_backend_auto 按型号判；显式 native ⇒ 静默 native（不告警）；
     // 精确 ngx 与非法值 ⇒ 强制 Native + 一条固定告警。
     {

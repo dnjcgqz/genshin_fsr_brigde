@@ -1048,6 +1048,39 @@ motion 写 `{-1, …}` 并派发（正确）；第 2 帧 depth 判「`1` 没变�
 
 ---
 
+## 17. NGX 初始化前的能力拒绝（实验键 `NgxRefuseUnsupported`）：判定前提零样本，默认关
+
+**现状**：`Dx11FsrBridge.ini` 的 `[Dx11FsrBridge]` 段新增 `NgxRefuseUnsupported`（默认 `0`，实验键）。
+
+- 键=`0`（默认）：`ensure_init` 与引入该键之前**行为等价**（只多两次 `bool` 判断与短路）—— 初始化前仍然查询 `NVSDK_NGX_D3D11_GetFeatureRequirements`，但只记日志、不参与任何判定。
+- 键=`1`：若查询成功、且回答者是**真 NGX 运行时**（不是 OptiScaler 一类代理），且厂商答的能力位**精确等于**「GPU 架构不支持」（`4`）或「OS 版本低于最低要求」（`8`），则在该局**不执行** `Init_Ext`：打一条 `ngx_core init refused at=preinit reason=… raw=0x… min_arch=… min_os=… pci=… proxy=…`，置既有不可逆放手位（`g_release_all`）、按既有语义退避 5 s、返回失败 ⇒ 该局不创建超分实例，交回原生上采样（fail-open，不黑屏）。其余一切输入（代理在回答 / 查询失败 / 驱动版本不支持 / 该接口未生效 / feature 未实现 / 任意组合位与未知位）**一律照常初始化**。
+
+判定本身是一个零依赖纯函数（`ngx_gate::decide()`），单测穷举钉死「实现 == 决策表」；判据常量与 SDK 枚举之间另有编译期 `static_assert` 绑定，SDK 枚举漂移会在编译期报错而不是静默错判。
+
+**为什么默认关**：本功能的正确性依赖一条**零样本**前提 ——「厂商答「架构不支持 / OS 版本过低」⇒ `Init_Ext` 必然失败」。该前提在现有全部现场日志里从未出现（开发机只有一块 RTX 4070、一套 Windows，能力位恒为「支持」，触发条件无法制造），且本功能的价值只在「跳过那次注定失败的调用 + 提前给出可读原因」，属小收益。默认关有两个作用：① 不改变任何用户的现有行为（默认值 = 改动前行为）；② 保留**证伪通道** —— 若默认开，受影响机器将永不再产出「能力位 + 随后初始化是否成功」这一对现场读数，也就再也无法证伪该前提。
+
+**未验证 / 待办**：
+
+1. **反向命题零样本**：没有任何现场读数证明「厂商答不支持 ⇒ `Init_Ext` 失败」。需要一条真实日志：能力位为 `4` 或 `8`，且同一局随后出现 `ngx_core init ok=0`。
+2. **矛盾样本会直接否证本功能**：若出现「能力位为 `4` 或 `8`，但同一局 `Init_Ext` 成功（`ngx_core init ok=1`）」，说明厂商答案与真实可用性不一致 ⇒ 应回滚本功能，只保留「初始化前查询并记日志」的观测部分。
+3. **默认值翻转为 `1` 的前置条件**：至少拿到第 1 条所述样本一例之后，才能由另一次改动把默认值改为 `1`（届时应重新走独立审核）。
+4. **驱动版本位（`2`）本批不拒绝**：属已知未覆盖项，不是遗漏 —— 拒绝它需要另一条同样零样本的前提。
+5. **触发方向在本机不可验证**：开发机无法制造「架构不支持 / OS 版本过低」的现场，因此只做到「穷举单测 + 合成触发验证 fail-open + 默认关闭」。合成触发（临时改判据强制拒绝、跑一局确认画面不黑、随后回滚）已执行，见下方「已实测」。
+6. **拒绝后的 fail-open 路径会在整局刷日志**：合成触发那一局里，因为放手位被置位，每帧都走「NGX 整体放手 ⇒ `ffx12::dispatch` 返回失败 ⇒ 游戏自身渲染接管」的既有路径，产出约 2.2 万条 `ffx12_result rc=DISPATCH_FAILED`（INFO）+ 95 条 `ffx12_failed`（ERROR，每 256 次一条）。该形态**不是本功能新造**：它与既有「`Init_Ext` 失败后放手」同形（历史上一局 `create_feature` 失败也出现过同样的风暴）。但本功能让这种「整局放手」在真机上更容易出现 ⇒ **若将来把默认值翻转为 `1`，应同时给这条 fail-open 路径加计数闸门**（日志口径规范要求「诊断日志必须有计数闸门，不能只靠等级闸门」）。本批**不做**（一次改动只做一件事）。
+7. **部署脚本例外**：`scripts/Deploy-Bridge.ps1` 的 `$configValues` **有意不包含**本键（与 `NgxZeroCopy` 同理由：该脚本每次部署覆盖 ini，加进去会把用户手改的 opt-in 重置回默认，从而掐断上述证伪通道）。当前生效的同步点为 `load_config`、`Dx11FsrBridge.package.ini`、提交信息、本条目。
+
+**已实测（2026-11-29，RTX 4070 SUPER，`Ffx12Backend=ngx`，发布构建 + `NgxLogLevel=1`，单局单变量）**：
+
+- **键=`1` 且真 NGX 回答**（`proxy=0`，`entry=…\_nvngx.dll`，`raw=0x0`）：`ngx_core feature_req` 1 条 → `ngx_core gate armed at=preinit enable=1` 1 条 → **`init refused` 0 条** → `ngx_core init ok=1 available=1`。即「厂商答支持」时判据正确放行。
+- **键=`1` 且代理在回答**（`proxy=1`，`entry=…\OptiScaler\OptiScaler.dll`，硬件字段与上一局相同但 `min_arch=0`、`min_os` 为代理自报值）：`gate armed` 1 条 → `init refused` 0 条 → `init ok=1`。即代理的答案不参与判定。
+- **键=`0`**（同 `proxy=0` 条件）：`feature_req` 1 条、**`gate armed` 0 条**、`init refused` 0 条、`init ok=1`。即键=0 时判定块整体不进入，行为与引入本键之前一致。
+- **合成触发**（临时在决策层加「`proxy==0 && ok==1` 即拒绝」的编译期开关，独立构建目录，源码与交付物不含该开关；跑一局后回滚）：`gate armed` 1 条、`init refused` **恰 1 条**、`ngx_core init ok=` **0 条**（未走到 `Init_Ext`）、`all_black` 0、崩溃事件（Application 1000/1001/1002/1026）0 条、游戏连续运行 2 分 38 秒且画面正常渲染（截图在案）。即「拒绝动作 fail-open、不黑屏、拒绝行恰好一条」。这一局 `raw` 仍是真值 `0x0`，故 `reason=` 落到兜底串 `not_eligible` —— 决策层的兜底串就是为这种「判据之外的拒绝」准备的，不是缺陷。
+- 上述四局的 `ngx_core feature_req` 观测行（初始化前的既有取证行）均**恰好 1 条**，未因本功能而增删。
+
+**相关代码位置**：`Dx11FsrBridge/NgxFeatureGate.h`（决策表与原因串，纯函数，零依赖）、`Dx11FsrBridge/NgxFeatureGateTest.cpp`（穷举单测）、`Dx11FsrBridge/NgxBackend.cpp` 的 `ensure_init()` 第 5c 步与 `set_refuse_unsupported()`、`Dx11FsrBridge/NgxBackend.h`、`Dx11FsrBridge/Dx11FsrBridge.cpp` 的 `load_config()` 内本键读取点、`Dx11FsrBridge/Dx11FsrBridge.package.ini`。
+
+---
+
 ## 已解决
 
 ### NGX 参数袋（`NVSDK_NGX_Parameter` 虚表）厂商调用补 SEH 守卫（2026-11-24）
