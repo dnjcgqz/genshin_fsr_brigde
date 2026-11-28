@@ -2029,6 +2029,40 @@ __declspec(noinline) static NVSDK_NGX_Result guarded_get_caps(NVSDK_NGX_Paramete
     }
 }
 
+// 2026-11-29（#11）：GetFeatureRequirements 的 SEH 守卫（此前该入口**一次都没被调用过**）。
+//   证据（M0 探针，产物 probe/ngx_feature_req/）：真 NGX 的该入口在**未初始化**状态下就会被调用，
+//   且 ApplicationDataPath 传 nullptr 时**直接 AV（ex=0xC0000005）**；而发布构建无 /EHsc
+//   （Dx11FsrBridge/CMakeLists.txt 的 target_compile_options 只在 Debug 加 /EHsc），
+//   异常不会被任何人接住 ⇒ "游戏直接消失、日志 0 字节"。故与 guarded_init_ext / guarded_get_caps 同形。
+//
+// ★ 为什么 noinline 且体内**恰好一次**函数指针调用、**不含** C++ 展开对象：MSVC C2712
+//   （__try 与需要析构的对象不能同帧）。出参 req 由调用方持有，本函数只透传指针。
+// ★ crash_code **无条件先置 0**：与 guarded_get_caps 同一教训 —— 调用方局部量若忘记初始化，
+//   读到栈上垃圾值就会把"成功"误判成"崩溃"（方向相反的假警报）。
+// ★ 判空放在 wrapper 内、且**不进 __try**：入口为空是"确定的能力缺失"，不是"厂商实现崩了"；
+//   若拿空指针进 __try，crash_code 会变成 0xC0000005，日志就把它报成"厂商 DLL AV"——错误归因。
+//   ★ 这条保护是**防御性**的：调用点所在的 ensure_init 位于 bind_entries_from 之后，
+//     而该函数的不变式是"十项全有或全清"（见其函数头注释），正常路径上 g_req 必非空。
+//   ★ 注意 crash_code 用**独立局部量**接，异常码必须由调用点打印（与 §3.4.0 的"每个码都要有读取点"一致）。
+__declspec(noinline) static NVSDK_NGX_Result guarded_get_req(IDXGIAdapter *adapter,
+                                                             const NVSDK_NGX_FeatureDiscoveryInfo *info,
+                                                             NVSDK_NGX_FeatureRequirement *req,
+                                                             unsigned long *crash_code)
+{
+    *crash_code = 0;
+    if (g_req == nullptr)
+        return NVSDK_NGX_Result_Fail;
+    __try
+    {
+        return g_req(adapter, info, req);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *crash_code = static_cast<unsigned long>(GetExceptionCode());
+        return NVSDK_NGX_Result_Fail;
+    }
+}
+
 // 2026-11-18：DestroyParameters 的 SEH 守卫（此前是裸调用，见 release_query_params）。
 //   与 guarded_release 同形：返回值本来就被调用方丢弃，这里只关心"有没有把进程炸掉"。
 // ★ 判空后返回 true：g_destroy / params 任一为空即**无事可做**，不是失败 ——
@@ -2244,6 +2278,346 @@ static bool ensure_init(ID3D11Device *dev)
     if (appdata.empty())
         return fail_init(L"no_appdata", static_cast<unsigned>(GetLastError()));
     log_ngx_error(L"ngx_core appdata=%s", appdata.c_str());
+
+    // ========================================================================
+    // 2026-11-29（#11）：第 5b 步 —— NGX **初始化之前**的能力查询（只观测，不参与任何判定）
+    // ========================================================================
+    // 【为什么要有这一步】
+    //   排查"开了 DLSS 但没效果"时，现有全部日志只能说"NGX 初始化成功了"，
+    //   说不出"这个 feature 在本机到底支不支持"。`NVSDK_NGX_D3D11_GetFeatureRequirements`
+    //   是官方提供的、**在 Init 之前就能问**的那个答案（M0 探针实证：未初始化状态下可调用，
+    //   rc=0x1），而桥此前**一次都没调过它**（`g_req` 只被绑定、零调用点）。
+    //
+    // 【为什么刚好放在这里】
+    //   · 晚于全部必要输入：`hit`（第 1..3 步）、`fc`（第 4 步）、`appdata`（第 5 步）；
+    //     而 `appdata.empty()` 已经在上一行之前早退 —— 这不是可选项：M0 实证
+    //     `ApplicationDataPath=nullptr` 会让厂商实现**直接 AV**（17-6），本行就是那道安全阀。
+    //   · 早于第 6/7/8 步的全部失败路径（init_crash / init / get_caps_crash / no_params /
+    //     unavailable）—— 那些路径本来就问不出"支不支持"，**不是**本步的观测对象。
+    //   · 放在 Init_Ext **之前**才能保证答案与 Init 成功后实际走的那条路径用的是同一组入参。
+    //
+    // 【本步不改变任何行为分支】（阶段 B 的准入规则 B1–B9 全部未实施）
+    //   全部失败结局（入口缺失 / 适配器取不到 / 非成功码 / 厂商实现 AV）都**只写日志**，
+    //   随后照常落到 `guarded_init_ext(...)` —— 与改动前逐字相同，fail-open。
+    //
+    // 【"每次 ensure_init 至多一条"的上界】（不加计数闸门，§五.6 要求先给上界）
+    //   ① 本函数入口的 `g_inited` 短路 + 5 秒退避窗口 ⇒ 同一进程里至多几次；
+    //   ② 失败退避窗口内直接早退（不走进本段），`g_release_all` 置位后也不再进 init；
+    //   ③ 与相邻的 `provider pick` / `appdata=` 两行**同频** ⇒ 正常一局只有 1–2 条。
+    //   故不需要 log_ngx_error_throttled 的槽位（§五.6 的"计数闸门"针对的是每帧路径）。
+
+    // 2026-11-29（#11）：只赋初值，每个 if 分支**只改局部量**，不让任何分支自己打日志。
+    //   ★ 为什么必须这样组织（第 3 轮 MINOR-1："恰好一条"不能是结果，必须是结构）：
+    //     唯一调用点 + 分支只赋值 + 末尾**无条件**打印 ⇒ "段内恰好一个 log_ngx_error"
+    //     由代码形状保证，而不是靠后来者自觉。`return` 只允许出现在打印**之后**
+    //     （本步根本没有 return）。
+    //   ★ 也不许出现提前退出本段的跳转（return / goto / 跳出本段的外层 continue）：
+    //     任何一个都会让那一行凭空消失，而"少了一行"在日志里看起来和"这次没走到这一步"
+    //     一模一样。（上面 flags 循环里的 `continue` 只是跳过本趟迭代，不跳出本段，不受此限。）
+    int         ok        = 0;
+    unsigned    rc        = 0;
+    unsigned    ex        = 0;
+    const char *why       = "adapter_unavailable";   // 窄串，日志用 %hs；初值即适配器失败分支的取值，其余分支都会覆盖它
+    int         supported = -1;          // -1 = ok==0 ⇒ 不可判定（**不是**"不支持"）
+    unsigned    raw       = 0;
+    char        raw_str[16] {};          // "n/a" 或 "0x%X" 的**字符串**形态（M2-1，见下方打印处）
+    std::string flags_str = "-";         // 逗号拼接（§5-g）；未知位按位或后只打一个 other=0x%X
+    unsigned    min_arch  = 0;
+    std::string min_os_str = "-";        // 有界拷贝 + 可打印性检查（§5-g 的 min_os 处理）
+    unsigned    min_os_len = 0;          // strnlen(源,255)：与显示长度分离 ⇒ 截断可辨（MINOR-5）
+    std::string pci_str   = "none";      // 取不到时打 none，**不打 0000:0000**（§5-b）
+    int         proxy     = -1;          // 1=非 _nvngx.dll、0=是、-1=取不到（§5-g / M2-3）
+
+    // ---- ① 入口判空：最便宜的检查最先做（它一旦成立，adapter / DiscoveryInfo 全都不必算）----
+    //   **正常路径不可达**：本段在 bind_entries_from 之后，而它的不变式是"十项全有或全清"
+    //   （缺任一项就整套清空并早退，见该函数头注释）；且 shutdown_all() 只清 g_inited / 参数袋，
+    //   **不清这些函数指针**。留这条分支是为了让"万一"有个名字：此时 wrapper 返回的是通用 Fail
+    //   （0xBAD00000），与"厂商实现真的返回了 Fail"**同值** —— 只靠 rc 分不开，故必须单独给
+    //   why=no_entry。
+    //   ★ 判空放在调用方而不是只在 wrapper 内：wrapper 里的判空只保证"不拿空指针进 __try"，
+    //     它返回的 rc 仍是通用 Fail；区分"入口没了"与"实现返回 Fail"需要调用方这一处判断。
+    if (g_req == nullptr)
+    {
+        why = "no_entry";
+    }
+    else
+    {
+        // ---- ①b 适配器：从当前设备反查它所在的那块物理 adapter（§5-b）----
+        //   官方要求传"创建该设备的那块物理 adapter"；本机 _nvngx.dll 的反汇编在非空校验后
+        //   直接 GetDesc1，故空指针必然 AV —— 所以两条失败都必须早于调用**判掉**。
+        //   ★ 不加 `dev == nullptr` 判空：device 由 dispatch 的不变式保证非空，
+        //     在这里再判一次只会制造一条永不成立的"防御性分支"，掩盖真正的责任点。
+        //   ★ ComPtr：两条早退（QI 失败 / GetAdapter 失败）由析构自动 Release，
+        //     不需要手写配对的 `->Release()`（§三 #12：失败路径漏 Release 是本仓库抓到过的缺陷）。
+        Microsoft::WRL::ComPtr<IDXGIDevice>  dxgi_dev;
+        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+        HRESULT hr = dev->QueryInterface(IID_PPV_ARGS(dxgi_dev.GetAddressOf()));
+        if (SUCCEEDED(hr))
+            hr = dxgi_dev->GetAdapter(adapter.GetAddressOf());
+        if (FAILED(hr) || adapter.Get() == nullptr)
+        {
+            // 连 adapter 都没有 ⇒ 后面两个必填参数（adapter / pci）都无从谈起，
+            // 直接落到末尾那一行打印（why=adapter_unavailable，其余字段保持初值）。
+            why = "adapter_unavailable";
+        }
+        else
+        {
+            // pci= 的取值点就在这里：厂商实现自己也会去 GetDesc，日志里同一份事实
+            // 用同一来源（DXGI_ADAPTER_DESC），可与"用户报的显卡型号"直接对表。
+            DXGI_ADAPTER_DESC desc {};
+            if (SUCCEEDED(adapter->GetDesc(&desc)))
+            {
+                char tmp[32] {};
+                std::snprintf(tmp, sizeof(tmp), "%04X:%04X",
+                              static_cast<unsigned>(desc.VendorId),
+                              static_cast<unsigned>(desc.DeviceId));
+                pci_str = tmp;
+            }
+            // GetDesc 失败 ⇒ pci 保持初值 none（**不写 0000:0000**：那是一个看起来像真值的假事实）
+
+            // ---- ② 组装 DiscoveryInfo（§5-c，六个字段与 Init 同源）----
+            //   ★ 是 `Identifier.v.ApplicationId`（union v），不是 Identifier.ApplicationId。
+            //   ★ IdentifierType 必须是 Application_Id：M0 实测 Project_Id 被拒（0xBAD00005，17-5）。
+            //   ★ FeatureInfo 必须给：M0 实测 PathListInfo 里没有可解析目录时厂商实现返回
+            //     0xBAD00012（NotImplemented，17-8）—— 那是**环境**问题，不是硬件不支持。
+            NVSDK_NGX_FeatureDiscoveryInfo di {};
+            di.SDKVersion               = NVSDK_NGX_Version_API;
+            di.FeatureID                = NVSDK_NGX_Feature_SuperSampling;
+            di.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Application_Id;
+            di.Identifier.v.ApplicationId = g_app_id;
+            di.ApplicationDataPath      = appdata.c_str();
+            di.FeatureInfo              = &fc;
+
+            // 出参：值初始化。成功路径上厂商实现会写，失败路径上**一个字节都不写**
+            //   （M0 实测 17-2：失败时 written_bytes=0）⇒ 若不初始化，读到的就是栈上垃圾值。
+            //   ★ 不用 memset：`NVSDK_NGX_FeatureRequirement req {};` 已经零初始化全部 264 字节。
+            NVSDK_NGX_FeatureRequirement req {};
+            unsigned long req_crash = 0;
+            const NVSDK_NGX_Result req_rc = guarded_get_req(adapter.Get(), &di, &req, &req_crash);
+
+            // rc 与 ex **无条件**先落到局部量：成功路径也要打（ex=0x0），否则
+            //   "这一行到底跑没跑"就没法用同一形状比对（§5-g：ex 恒打印）。
+            rc = static_cast<unsigned>(req_rc);
+            ex = static_cast<unsigned>(req_crash);
+            if (req_crash != 0)
+            {
+                // 厂商实现接住的是异常 ⇒ 答案完全不可判定（不是"不支持"）。
+                why = "crash";
+            }
+            else if (req_rc == NVSDK_NGX_Result_Success)   // ★ 成功码是 0x1，**不是** 0
+            {
+                ok  = 1;
+                why = "ok";
+                raw       = static_cast<unsigned>(req.FeatureSupported);
+                min_arch  = static_cast<unsigned>(req.MinHWArchitecture);
+
+                // ---- supported：由 raw 派生（M3-1 的交叉一致性由这三行结构保证）----
+                //   0 = 支持 ⇒ 1；非 0 = 不支持 ⇒ 0。`ok==0` 那一支的 -1 在下方专门给，
+                //   **不能**在这里用一个"else -1"顺手带过 —— 那会把"没答上来"混进"支持/不支持"。
+                supported = (raw == 0) ? 1 : 0;
+
+                // ---- flags：raw 是位域（NVSDK_NGX_Feature_Support_Result）----
+                //   Supported(0) / CheckNotPresent(1) / DriverVersionUnsupported(2) /
+                //   AdapterUnsupported(4) / OSVersionBelowMinimumSupported(8) / NotImplemented(16)。
+                //   已知位给名字，**全部未知位按位或后只打一个** other=0x%X（不逐位重复输出）。
+                //   ★ 驱动版本维度（raw==2）本批**不拒绝**，只为后人留样本（§16-M4-1）。
+                if (raw == 0)
+                {
+                    flags_str = "-";
+                }
+                else
+                {
+                    struct ReqBit { unsigned bit; const char *name; };
+                    const ReqBit bits[] = {
+                        { NVSDK_NGX_FeatureSupportResult_CheckNotPresent,                "check_not_present" },
+                        { NVSDK_NGX_FeatureSupportResult_DriverVersionUnsupported,      "driver_ver" },
+                        { NVSDK_NGX_FeatureSupportResult_AdapterUnsupported,            "adapter" },
+                        { NVSDK_NGX_FeatureSupportResult_OSVersionBelowMinimumSupported,"os_below_min" },
+                        { NVSDK_NGX_FeatureSupportResult_NotImplemented,                "not_impl" },
+                    };
+                    unsigned known = 0;
+                    flags_str.clear();
+                    for (const ReqBit &b : bits)
+                    {
+                        known |= b.bit;
+                        if ((raw & b.bit) == 0)
+                            continue;
+                        if (!flags_str.empty())
+                            flags_str += ",";
+                        flags_str += b.name;
+                    }
+                    const unsigned rest = raw & ~known;
+                    if (rest != 0)
+                    {
+                        char tail[32] {};
+                        std::snprintf(tail, sizeof(tail), "other=0x%X", rest);
+                        if (!flags_str.empty())
+                            flags_str += ",";
+                        flags_str += tail;
+                    }
+                }
+
+                // ---- min_os：有界拷贝 + 可打印性检查（§5-g「min_os 处理」/ MINOR-4②、MINOR-5）----
+                //   MinOSVersion 是 `char[255]`，**不保证** NUL 结尾（失败/截断都见过）⇒
+                //     ① min_os_len 用 strnlen(源,255)：它报的是"源里的真实长度"，
+                //        与显示长度分离 ⇒ 被截断时可辨（MINOR-5：memchr 判不了截断）；
+                //     ② 拷贝到 char[65] 并**每一位**校验 0x20..0x7E：控制字符 / 非 ASCII 本来就等价于
+                //        "这串不是可读的版本号"，照抄进日志只会让现场多一行没法引用的乱码；
+                //     ③ 任一位不合法或 64 字节内没有 NUL ⇒ 改打 min_os=0x + 前 8 字节 hex，
+                //        既有界、又保留了"里面到底是什么"的线索。
+                //   ★ 空串 ⇒ `-`（M2-2）：已支持的 feature 很可能返回空 MinOSVersion，
+                //     打一个空字段会让日志形态断言误红。
+                min_os_len = static_cast<unsigned>(strnlen(req.MinOSVersion, 255));
+                if (min_os_len == 0)
+                {
+                    min_os_str = "-";
+                }
+                else
+                {
+                    const unsigned n = (min_os_len < 64) ? min_os_len : 64;
+                    bool printable = true;
+                    for (unsigned i = 0; i < n; ++i)
+                    {
+                        const unsigned char c = static_cast<unsigned char>(req.MinOSVersion[i]);
+                        if (c < 0x20 || c > 0x7E)
+                        {
+                            printable = false;
+                            break;
+                        }
+                    }
+                    // ★★ 2026-11-29（审核 r1 MAJOR）：判定条件只有 `min_os_len <= 64`，**不要**再
+                    //   加 `|| req.MinOSVersion[n] == '\0'`（上一版正是这么写的，条件写反了）。
+                    //   ① 语义：`min_os_len = strnlen(源,255)` 就是"首个 NUL 的下标"（255 = 255 字节内无 NUL）
+                    //      ⇒ `min_os_len <= 64` **当且仅当** NUL 的下标 ≤ 64，也就是"连同终止符
+                    //      正好放得进 char[65]、一个字节都不用丢"。
+                    //      而 `min_os_len > 64` 恰恰是"会被截断"的那一侧 —— 上一版把它放进了
+                    //      "当正常版本串拷贝"的分支，等于把超长脏串静默截成 64 字符、当正常版本号
+                    //      打印出来，让"形如 ^\d+\.\d+"的形态断言**假绿**（§三 #21：旁证成立≠内容正确）。
+                    //   ② 安全：`min_os_len <= 64` 成立时 `n == min_os_len`，`dst[n]` 落在 char[65]
+                    //      的最后一格；不成立时 `n == 64`。两种情形 `memcpy(dst, 源, n)` 都界内。
+                    //      上一版那个下标读取 `req.MinOSVersion[n]` 在 `n == 64` 时读的是源的第 65 字节，
+                    //      虽然仍界内（源是 char[255]），但它**不能**证明"有 NUL"（只证明第 65 字节是 0），
+                    //      是一次既多余又误导的读取 —— 已删。
+                    //   ③ 于是"看见 hex 形态"严格等价于"这串不是一个 ≤64 字节的可读版本号"。
+                    if (printable && min_os_len <= 64)
+                    {
+                        char dst[65] {};
+                        memcpy(dst, req.MinOSVersion, n);
+                        dst[n] = '\0';
+                        min_os_str = dst;
+                    }
+                    else
+                    {
+                        // ★ 2026-11-29（审核 r1 追加）：上界必须是 `i < min_os_len`，**不能**只写 `i < 8`。
+                        //   源是 char[255]、`req {}` 已零初始化 ⇒ 只写 `i < 8` 也**界内**，但当
+                        //   `min_os_len < 8`（如一个 6 字节的脏串）时，第 7、8 字节是**零填充**、
+                        //   **不是这串的内容**；把它打进日志等于凭空多出两个不存在的字节，
+                        //   读者会据此以为这串有 8 字节（§二.2「日志不许撒谎」）。
+                        //   故按**真实长度**取：`i < 8 && i < min_os_len`。
+                        char hex[32] {};
+                        int used = std::snprintf(hex, sizeof(hex), "0x");
+                        for (unsigned i = 0; i < 8 && i < min_os_len
+                                       && used > 0 && used < static_cast<int>(sizeof(hex)); ++i)
+                        {
+                            used += std::snprintf(hex + used, sizeof(hex) - static_cast<std::size_t>(used),
+                                                  "%02X",
+                                                  static_cast<unsigned char>(req.MinOSVersion[i]));
+                        }
+                        min_os_str = hex;
+                    }
+                }
+            }
+            else if (req_rc == NVSDK_NGX_Result_FAIL_NotImplemented)   // 0xBAD00012
+            {
+                // M0 实证（17-8）：PathListInfo 里没有任何一个目录真的含 nvngx_dlss.dll 时，
+                //   厂商实现返回 NotImplemented，且**一个字节都不写结构体**。
+                //   ⇒ 这是**运行环境**问题（feature DLL 找不到），不是"硬件不支持"。
+                //   单独起一个 why 值，就是为了不让它被读成"不支持"。
+                why = "no_feature_dll";
+            }
+            else
+            {
+                // 其余失败码（0xBAD0000x 系列 / 通用 Fail）：只记 rc，不解释。
+                why = "rc_failed";
+            }
+        }
+    }
+
+    // ---- ③ 归因：proxy 由**完整**入口路径派生（§5-g / M2-3）----
+    //   ★ 必须用完整的 g_entry_module_path，**不能**用下面日志里 %.260s 截断后的显示串：
+    //     截断可能正好切掉 "_nvngx.dll" 这个基名，proxy 就会变成一个随路径长度变化的假值。
+    //   ★ 合取 `kind != nvngx_load`：`nvngx_load` 是"按裸名 LoadLibrary 装载成功"，
+    //     它并不保证被装载的就是真 NGX（DLL 搜索顺序会把同名文件解析到别处）。
+    //   ★ 2026-11-29（审核 r1 MINOR-2）：`hit.kind` 有**四**个取值（见 ProviderHit 的初值），
+    //     第四个是 `unknown` —— 它表示"不知道是谁在回答"。结构上走不到（ensure_init 早前
+    //     已对 is_failure 早退），但一旦走到，用路径名硬判 0/1 就是在**没有证据**的情况下
+    //     断言"这就是真 NGX / 这就是代理"。故同样排除 ⇒ proxy 落到 -1（不知道），
+    //     与"取不到入口路径"合并成同一个含义：**信息不足，不下结论**。
+    //   ★ 1 = 由非 _nvngx.dll 的名字在回答（OptiScaler 一类代理）；0 = 真 NGX；
+    //     -1 = 取不到入口路径 / kind 为 nvngx_load 或 unknown ⇒ **不知道**，不是"真 NGX"。
+    if (!g_entry_module_path.empty() && _wcsicmp(hit.kind, L"nvngx_load") != 0
+        && _wcsicmp(hit.kind, L"unknown") != 0)
+    {
+        const std::size_t slash = g_entry_module_path.find_last_of(L"\\/");
+        const wchar_t *base_name = (slash == std::wstring::npos)
+                                       ? g_entry_module_path.c_str()
+                                       : g_entry_module_path.c_str() + slash + 1;
+        proxy = (_wcsicmp(base_name, L"_nvngx.dll") == 0) ? 0 : 1;
+    }
+
+    // ---- ④ raw 的**显示形态**：ok==0 一律打字面 `n/a`（§16-M2-1，对 §5-g 的加严）----
+    //   ★ 为什么不能统一打 `0x0`：`raw=0x0` 正是 "Supported" 的指纹（M0 实测 17-3：成功路径
+    //     就是 raw=0x0）。查询没成功时打 `raw=0x0`，等于给现场发了一个**和"本机支持"
+    //     一模一样**的值；同行的 `ok=0` 只在**同一行内**消歧，挡不住"抄一行出去"——
+    //     把 `raw=0x0` 单独抄进报告、没带 `ok=0`，结论就变成"本机支持"。
+    //   ★ 故 ok==0 打字面 `n/a`：它不可能被误读成任何取值，跨行抄录也安全。
+    //   ★ 仍是**一个**格式串：只把数值位换成字符串位，实参是 char[] ⇒ 宽格式里必须用 **%hs**
+    //     （用 %s 会把窄串当宽串读，打出乱码）；`raw_str` 因此只放 "n/a" / "0x…" 两种形态。
+    if (ok == 1)
+        std::snprintf(raw_str, sizeof(raw_str), "0x%X", raw);
+    else
+        std::snprintf(raw_str, sizeof(raw_str), "n/a");
+
+    // ★★ 结构不变式（§3-2 / MINOR-1）：下面**是**本段唯一的 log_ngx_error 调用点，
+    //   **是**唯一格式串，且**无条件**执行 —— 上面每个分支只给局部量赋值，没有一个分支
+    //   自己打日志、也没有一个分支 return。"每次 ensure_init 恰好一条"因此是代码形状的
+    //   推论，而不是靠后面维护者的自觉。改这一段时请保住这两条：① 不新增调用点；
+    //   ② 不让任何分支提前 return。
+    //
+    // 【日志缓冲上界 ≈632 宽字符】（vlog_ngx 的 buf 是 wchar_t[1024] = _TRUNCATE 截断）
+    //   前缀 · 固定部分 ≈60（"ngx_core feature_req at=preinit " 等）
+    //   + ok/rc/ex/why ≈ 48 + supported/raw ≈ 22 + flags ≈ 40 + min_arch ≈ 16
+    //   + min_os ≈ 24 + min_os_len ≈ 16 + pci ≈ 16 + kind ≈ 24（四值之一）
+    //   + entry ≈ 260（%.260s 上限）+ proxy ≈ 10 + 字段间 ≈ 96 ⇒ 合计 ≈632
+    //   ⇒ 余量 ≈390 宽字符。
+    //
+    // ★★ 2026-11-29（审核 r1 MINOR-1）：**溢出时的真实后果是"尾部字段被吃掉"，不是"整行消失"**。
+    //   上一版这里写的是"buf 为空 ⇒ 整行丢失"，与 MSVC 行为相反 —— 已实测证伪：
+    //   `_vsnwprintf_s(buf, 1024, _TRUNCATE, L"%s", 1299 个 x)` 返回 -1，但 buf 里**保留前 1023
+    //   个宽字符**（wcslen=1023，实测见 local-only/_vsnwprintf_check.cpp 的 case2/case3：
+    //   cap=32 时同样保留 31 个）。所以行还在，被静默截掉的是**尾部字段**，本行最后一个是 `proxy=`。
+    //   ⇒ ① entry 封顶 %.260s、flags 只留一个 other= 的目的应读作"**保住尾部字段**"，
+    //        不是"保住整行"；
+    //     ② 这种截断**不增加** BridgeLogger 的 `dropped=` 计数（那是队列满时丢最旧条目的计数，
+    //        见 BridgeLogger.cpp 的 writer_stopped 行），所以它比"整行丢失"更隐蔽 ——
+    //        现场看到一行缺了尾巴，**不能**据此断定"没丢日志"。
+    //   ★ 上式的 raw 一项按数值形态（≤10 字符）算；改成 "n/a" 后只会更短，上界仍然成立。
+    //
+    // 【为什么是 hit.kind / entry 而不是 hit.nvidia】
+    //   hit.nvidia 只表示"走的是注册表发现路径"，**不表示谁在回答**：本机实测日志里
+    //   `provider=nvidia_registry` 而 `entry=...OptiScaler.dll` —— 用 hit.nvidia 归因会把
+    //   代理合成的答案标成真 NGX。
+    //
+    // 【ok=0 与 raw 的 NotImplemented 位（0x10）是两件不同的事，永不可混为一谈（§17.9-3）】
+    //   `ok=0` = **这次查询没成功**（厂商实现没答，或答了但我们不敢读）⇒ supported=-1 不可判定；
+    //   `raw` 的 0x10 = **厂商实现明确答了"这个 feature 没实现"** ⇒ supported=0（确定不支持）。
+    //   把前者读成"不支持"会让"明明支持、只是这次没问到"被误判成硬件不行（§五.1）。
+    log_ngx_error(L"ngx_core feature_req at=preinit ok=%d rc=0x%X ex=0x%X why=%hs supported=%d "
+                  L"raw=%hs flags=%hs min_arch=%u min_os=%hs min_os_len=%u pci=%hs kind=%s "
+                  L"entry=%.260s proxy=%d",
+                  ok, rc, ex, why, supported, raw_str, flags_str.c_str(), min_arch, min_os_str.c_str(),
+                  min_os_len, pci_str.c_str(), hit.kind,
+                  g_entry_module_path.empty() ? L"(unknown)" : g_entry_module_path.c_str(), proxy);
 
     // ---- 第 6 步：Init_Ext(app_id, appdata, dev, NVSDK_NGX_Version_API, &fc) ← 第 5 参是 fc ----
     // 2026-11-17：改走 SEH 守卫（§3.4.0）。g_init_ext 是厂商 DLL 实现，AV 会带走整进程。
